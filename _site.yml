@@ -1,0 +1,42 @@
+name: "cbromley_artwork"
+output_dir: "."
+navbar:
+  title: "Christian Bromley"
+  left:
+    - text: "Home"
+      href: home.html
+    - text: "Analytics"
+      menu:
+        - text: "Analytics Home"
+          href: analytics.html
+        - text: "Mining WhatsApp Groups"
+          href: whatsapp.html
+    - text: "Artwork"
+      menu:
+        - text: "Artwork Home"
+          href: index.html
+        - text: "Landscape"
+          href: landscape.html
+        - text: "Animals"
+          href: animals.html
+        - text: "Random"
+          href: random.html
+    - text: "About me"
+      href: about.html
+    - text: "Publications"
+      href: publications.html
+  right: 
+    - icon: fa-envelope fa-lg
+      href: mailto:<cbromley66@googlemail.com>
+    - icon: fa-github fa-lg
+      href: http://github.com/christianbromley/
+    - icon: fa-linkedin fa-lg
+      href: https://www.linkedin.com/in/christian-bromley-8ab99475/
+    - icon: fa-instagram fa-lg
+      href: https://www.instagram.com/cbromley_artwork/
+output: 
+  html_document:
+    theme: readable
+    css: styles.css
+    include:
+      after_body: footer.html

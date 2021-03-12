@@ -1,0 +1,27 @@
+---
+title: "Landscapes"
+output: html_document
+---
+
+These are all of places that exist purely in my imagination...
+
+# Lockdown
+
+<img src="otherpics/IMG_2246.JPG" style="width:50%">
+
+# Lockdown
+
+<img src="otherpics/IMG_6299.JPG" style="width:50%">
+
+# Dark Clouds Beyond
+
+<img src="painting/dark_clouds_beyond.jpeg" style="width:50%">
+
+# Road to Nowhere
+
+<img src="painting/road_nowhere.jpeg" style="width:50%">
+
+# Creek
+
+<img src="painting/creek.jpeg" style="width:50%">
+

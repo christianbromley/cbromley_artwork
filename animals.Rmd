@@ -1,0 +1,58 @@
+---
+title: "Animals"
+output: html_document
+---
+
+# Blue Tit
+
+We had a great time watching these active little birds in the garden during the first lockdown and this was my first attempt at painting an animal. I got a bit obsessed from this point.
+
+<img src="painting/blue_tit.jpeg" style="width:50%">
+
+# Woodpecker
+
+I probably couldn't have told you what a woodpecker even looks like before 2020. 
+
+<img src="painting/woodpecker.jpeg" style="width:50%">
+
+# Ram
+
+<img src="painting/ram.jpeg" style="width:50%">
+
+# Deer
+
+This is my absolute favourite. We saw plenty of deer on our walks through the Worcestershire countryside throughout 2020.
+
+<img src="painting/true_deer.jpeg" style="width:50%">
+
+# Fox
+
+I really wish I'd picked more of a dull background but never mind, it's too late now!
+
+<img src="painting/fox.jpeg" style="width:50%">
+
+# Horse
+
+Got to be Red Rum hasn't it...
+
+<img src="painting/horse.jpg" style="width:50%">
+
+# Orca
+
+I really haven't got to grips with how you paint the sea. I thought I'd just do it in blobs of paint instead. 
+
+<img src="painting/orca.jpg" style="width:50%">
+
+# Frog
+
+Things got really weird here. 
+
+<img src="painting/frog.jpg" style="width:50%">
+
+# Camel
+
+There was a piece in the latest David Attenborough series about camels in Mongolia that eat snow. That was my inspiration for this one.
+
+<img src="painting/camel.jpg" style="width:50%">
+
+

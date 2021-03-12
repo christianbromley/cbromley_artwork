@@ -1,0 +1,16 @@
+---
+title: "Publications"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# NK cells, cancer inflammation and anti-tumour immunity
+
+<img src="otherpics/bonavita.png" style="width:50%">
+
+We recently published a paper in [Immunity](https://pubmed.ncbi.nlm.nih.gov/33220234/) if you want to learn about Natural Killer cells, inflammation and cancer!
+
+More to come...

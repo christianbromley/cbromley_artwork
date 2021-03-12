@@ -1,0 +1,12 @@
+---
+title: "Home"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+__An Eclectic Mix of Analytics and Artwork__
+
+<img src="painting/camel.jpg" style="width:80%">

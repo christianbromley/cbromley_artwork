@@ -1,0 +1,10 @@
+---
+title: "Analytics Home"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+I am trying to learn different analytical methods, and my intention is to post blogs tracking this journey.

@@ -1,0 +1,1435 @@
+---
+title: "Understanding Personalities By Analysing Messages in a WhatsApp Group"
+output:
+  html_document:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, dpi=120,  fig.fullwidth=TRUE)
+```
+
+During lockdown I figure it would be handy to know how to manipulate and an analyse text. I spend all my time working with numbers but there's such information in the words we produce, publish, post and share, so I figure it would be a fun learning exercise.
+
+I then got thinking about what text I wanted to analyse. I have done a bit of analysis on publication abstracts, but I figured that outside of work it would be much more interesting to analyse WhatsApp chats. 
+
+Since we have been locked down keeping up-to-date with your mates is a challenge. Can't see them, can't go round for a cup of tea, can't go to the pub, can't travel. It's all a bit tough. All we have is our WhatsApp chats, but let's be honest in groups there's a lot of __noise__ to sift through before you can actually get to the truth of how someone is feeling.
+
+I therefore had this idea, that if I could download, process and analyse the chats within WhatsApp groups in an automated fashion, quantifying my mates' emotions, and tracking their WhatsApp behaviour...then it would be a more efficient way of monitoring my mates. Instead of reading through the 1000s of messages that get pushed into my groups on a monthly basis, I could just run my algorithm, and obtain the outputs that I'm really interested in.
+
+But what am I interested in...
+
+Well I figured that I first want to be able to learn about my mates' WhatsApp activity. What is their baseline/ mean behaviour on the group? This way I can set a benchmark to then measure, quantify and detect drastic changes in their behaviour which may give insights into their mental wellbeing.
+
+More than anything, though, this is just the chance for me to learn a few new skills, so let's see how it goes.
+
+# Get the data and anonymise
+
+First I will load in some Whatsapp chat histories. I'll anonymise people swapping them for scorers from the 2002 world cup courtesy of [FBref](https://fbref.com/en/comps/1/17/shooting/2002-FIFA-World-Cup-Stats#stats_shooting).
+
+Who do we have in our chat?
+
+
+```{r, echo=FALSE, error=FALSE, message=FALSE, warning=FALSE}
+library(rwhatsapp)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(ggridges)
+library(RColorBrewer)
+library(tidytext)
+library(factoextra)
+library(syuzhet)
+library(data.table)
+library(pheatmap)
+library(stopwords)
+library(zoo)
+library(SentimentAnalysis)
+library(ggimage)
+library(ggrepel)
+
+# read in your chats
+chat1 <- rwa_read(file.path("~/Documents/Personal/christianbromley.github.io/cbromley_artwork/dataset", "_chat.txt"))
+
+chat2 <- rwa_read(file.path("~/Documents/Personal/christianbromley.github.io/cbromley_artwork/dataset", "_chat 2.txt"))
+
+
+# first check levels to see if there's any that need merging if authors names changed
+
+chat1 <- chat1 %>%
+  mutate(author = case_when(author %in% c("Sam Final Gray", "Sam Gray Actual") ~ "Sam Gray",
+                            TRUE ~ as.character(author)),
+         group = rep(1, nrow(.)))
+
+chat2 <- chat2 %>%
+  mutate(
+         author = case_when(author %in% c("Sam Final Gray", "Sam Gray Actual", "Gray Sam") ~ "Sam Gray",
+                            author %in% c("Aussie Ball", "Adim Ball", "NewAdim Ball") ~ "Adim Ball",
+                            author %in% c("Dom", "Liam Smith") ~ "Dom",
+                            author %in% c("Nutman", "Nutty/1") ~ "Nut",
+                            grepl("7572", author) ~ "Nay Patrick",
+                            TRUE ~ as.character(author)),
+         group = rep(2, nrow(.)))
+
+
+chats <- chat1 %>% bind_rows(chat2)
+
+# write a function to anonymise
+
+anonymise <- function(chat_file){
+  
+  scorers <- read.table(file.path("~/Documents/Personal/christianbromley.github.io/cbromley_artwork", "dataset/world_cup_02_scorers.txt"), sep="\t", header=T)
+  
+  swaps <- as.character(scorers$Player)
+  swaps <- gsub("-", "_", swaps)
+  
+  #remove first row
+  chat_file <- chat_file[-1,]
+  
+  # remove NAs
+  if(sum(is.na(chat_file$author)) > 0){
+    chat_file <- chat_file[-which(is.na(chat_file$author)),]
+  }
+
+  
+  # remove rows of 
+  tmp <- as.data.frame(table(chat_file$author))
+  remove_authors <- tmp$Var1[tmp$Freq < 10]
+  chat_file <- chat_file[-which(chat_file$author %in% remove_authors),]
+  
+  # drop levels
+  chat_file$author <-  droplevels(factor(chat_file$author))
+  
+  # change levels
+  
+  id_tab <- data.frame(original = levels(chat_file$author), newid = swaps[1:nlevels(factor(chat_file$author))])
+  
+  levels(chat_file$author) <- swaps[1:nlevels(factor(chat_file$author))]
+  
+  chat_file$mate <- chat_file$author
+  
+  lls <- list(chat_file = chat_file, id_tab = id_tab)
+  
+  return(lls)
+  
+  
+}
+
+chat <- anonymise(chats)
+
+id_match <- chat[[2]]
+chat <- chat[[1]]
+
+print(levels(chat$mate))
+```
+
+No lets's run a function over the data that computes basic stats related to each person's whatsapp behaviour. This is the feature generation process.
+
+```{r, error=FALSE, message=FALSE, warning=FALSE}
+compute_whatsapp_stats <- function(chat, conversation_cutoff = 100){
+
+  # create vars
+  chat <- chat %>%
+    mutate(date = as.Date(time),
+           year = year(time),
+           month = month(time),
+           yearmon = as.yearmon(time))
+  
+  # get total messages first  
+  basic <- chat %>%
+      group_by(mate) %>%
+      summarise(total_messages = n())
+  
+ 
+  # compute time since first message and last
+    messages_per_day_since_d1 <- chat %>%
+      group_by(group, mate) %>%
+      summarise(n = n(),
+                min = min(date, na.rm=T),
+             max = max(date, na.rm=T),
+             active_time = max-min) %>%
+      filter(active_time != 0) %>%
+      mutate(diff_days = as.numeric(active_time),
+             messages_per_day = n / diff_days) %>%
+      select(group, mate, messages_per_day) %>%
+      tidyr::pivot_wider(names_from = group,
+                       #  names_prefix = "groupchat",
+                       names_glue = "group{group}_messages_per_day",
+                  values_from = messages_per_day)
+    
+    # sequences per day
+    seqpd <- chat %>% 
+        group_by(seqid = with(rle(as.character(mate)), rep(seq_along(lengths), lengths))) %>%
+        summarize(mate,date,group,
+              sequence = n()) %>%
+        distinct(seqid, .keep_all = T) %>%
+      group_by(group, mate) %>%
+      summarise(n = n(),
+                min = min(date, na.rm=T),
+             max = max(date, na.rm=T),
+             active_time = max-min,
+             seq1 = sum(sequence == 1),
+                seq2 = sum(sequence >= 2),
+                seq3 = sum(sequence >= 3),
+                seq4 = sum(sequence >= 4),
+                seq5 = sum(sequence >= 5),
+                seq6 = sum(sequence >= 6),
+                seq7 = sum(sequence >= 7),
+                seq8 = sum(sequence >= 8),
+                seq9 = sum(sequence >= 9),
+                seq10 = sum(sequence >= 10)) %>%
+      mutate(diff_days = as.numeric(active_time),
+             seq_per_day = n / diff_days,
+             seq1_per_day = seq1 / diff_days,
+             seq2_per_day = seq2 / diff_days,
+             seq3_per_day = seq3 / diff_days,
+             seq4_per_day = seq4 / diff_days,
+             seq5_per_day = seq5 / diff_days,
+             seq6_per_day = seq6 / diff_days,
+             seq7_per_day = seq7 / diff_days,
+             seq8_per_day = seq8 / diff_days,
+             seq9_per_day = seq9 / diff_days,
+             seq10_per_day = seq10 / diff_days) %>%
+      select(group, mate, seq_per_day:seq10_per_day) %>%
+      tidyr::pivot_wider(names_from = group,
+                          names_glue = "group{group}_{.value}",
+                  values_from = c(seq_per_day:seq10_per_day))
+    
+    basic <- messages_per_day_since_d1 %>%
+      full_join(seqpd, by = "mate") %>%
+      full_join(basic, by = "mate")
+    
+       
+    # now we want to determine acivity within conversations
+    # how do we define conversations?
+    
+    # a conversation occurs on one day and involves greater than 100 messages
+    convo_dates <- chat %>%
+      group_by(group, date) %>%
+      summarise(n = n()) %>% 
+      arrange(-n) %>%
+      filter(n >= conversation_cutoff) %>%
+      pull(date)
+    
+    basic <- chat %>%
+      filter(date %in% convo_dates) %>%
+      group_by(group, date, mate) %>%
+      summarise(total = n()) %>%
+      group_by(group, mate) %>%
+      summarise(convos_partaken = n(),
+                sum_message = sum(total)) %>%
+      mutate(message_per_convo = sum_message / convos_partaken) %>%
+      select(group, mate, message_per_convo) %>%
+      tidyr::pivot_wider(names_from = group,
+                          names_glue = "group{group}_{.value}",
+                  values_from = message_per_convo) %>%
+      full_join(basic, by = "mate")
+    
+    
+    added_basic <- chat %>%
+      filter(date %in% convo_dates) %>%
+      group_by(seqid = with(rle(as.character(mate)), rep(seq_along(lengths), lengths))) %>%
+        summarize(mate,date,group,
+              sequence = n()) %>%
+        distinct(seqid, .keep_all = T) %>%
+      group_by(group, date, mate) %>%
+      summarise(total = n(),
+                seq1 = sum(sequence == 1),
+                seq2 = sum(sequence >= 2),
+                seq3 = sum(sequence >= 3),
+                seq4 = sum(sequence >= 4),
+                seq5 = sum(sequence >= 5),
+                seq6 = sum(sequence >= 6),
+                seq7 = sum(sequence >= 7),
+                seq8 = sum(sequence >= 8),
+                seq9 = sum(sequence >= 9),
+                seq10 = sum(sequence >= 10)) %>%
+      group_by(group, mate) %>%
+      summarise(convos_partaken = n(),
+                sum_message = sum(total),
+                sum_seq1 = sum(seq1),
+                sum_seq2 = sum(seq2),
+                sum_seq3 = sum(seq3),
+                sum_seq4 = sum(seq4),
+                sum_seq5 = sum(seq5),
+                sum_seq6 = sum(seq6),
+                sum_seq7 = sum(seq7),
+                sum_seq8 = sum(seq8),
+                sum_seq9 = sum(seq9),
+                sum_seq10 = sum(seq10)) %>%
+      mutate(seq_per_convo = sum_message / convos_partaken,
+             seq1_per_convo = sum_seq1 / convos_partaken,
+             seq2_per_convo = sum_seq2 / convos_partaken,
+             seq3_per_convo = sum_seq3 / convos_partaken,
+             seq4_per_convo = sum_seq4 / convos_partaken,
+             seq5_per_convo = sum_seq5 / convos_partaken,
+             seq6_per_convo = sum_seq6 / convos_partaken,
+             seq7_per_convo = sum_seq7 / convos_partaken,
+             seq8_per_convo = sum_seq8 / convos_partaken,
+             seq9_per_convo = sum_seq9 / convos_partaken,
+             seq10_per_convo = sum_seq10 / convos_partaken) %>%
+      select(group, mate, seq_per_convo:seq10_per_convo) %>%
+      tidyr::pivot_wider(names_from = group,
+                          names_glue = "group{group}_{.value}",
+                  values_from = c(seq_per_convo:seq10_per_convo)) %>%
+      full_join(basic, by = "mate")
+    
+    return(added_basic)
+    
+}
+
+
+wstats <- compute_whatsapp_stats(chat = chat, conversation_cutoff = 100)
+    
+    
+compute_sentiment_stats <- function(chat, word_freq_cut){
+  
+  # create vars
+  chat <- chat %>%
+    mutate(date = as.Date(time),
+           year = year(time),
+           month = month(time),
+           yearmon = as.yearmon(time))
+  
+  # analyse sentences
+  sentiments <- data.frame()
+  
+    for(i in 192728:length(chat$text)){
+      
+      m1 <- get_sentiment(chat$text[i], method = "syuzhet")
+      m2 <- get_sentiment(chat$text[i], method = "bing")
+      m3 <- get_sentiment(chat$text[i], method = "afinn")
+      m4 <- get_sentiment(chat$text[i], method = "nrc")
+      tmp <- data.frame(syuzhet = m1, bing = m2, afinn = m3, nrc = m4)
+      syuzhet_vector <- get_nrc_sentiment(chat$text[i])
+      syuzhet_vector <- cbind(syuzhet_vector, tmp)
+      sentiments <- rbind(sentiments, syuzhet_vector)
+    }
+  
+  super <- cbind(chat, sentiments)
+  
+  # now engineer sentiment variables
+  advance <- super %>%
+      mutate(slot = rep(1, nrow(.))) %>%
+      group_by(mate) %>%
+      summarise_at(vars(anger:nrc, slot), sum) %>%
+      tidyr::pivot_longer(cols = c(anger:nrc),
+                          names_to = "sentiment",
+                          values_to = "cum.score") %>%
+      group_by(mate) %>%
+      mutate(freq = cum.score / slot) %>%
+      tidyr::pivot_wider(values_from = c(cum.score, freq),
+                  names_from = sentiment)
+  
+  # get stop words
+  remove_stops <- c(stopwords(),
+                   "media",
+                   "omitted",
+                   "ref","image", "https")
+  
+  # get words used at least ten times
+  keep_words <- super %>%
+      unnest_tokens(input = text,
+                    output = word) %>%
+      filter(!word %in% remove_stops) %>%
+      count(word, sort = TRUE) %>%
+      filter(n > word_freq_cut) %>%
+      pull(word)
+  
+  word_usage_tab <- super %>%
+      unnest_tokens(input = text,
+                    output = word) %>%
+      filter(word %in% keep_words) %>%
+      count(mate, word, sort = TRUE) %>%
+      
+      mutate(word = factor(stringr::str_replace_all(word, "[[:punct:]]", "_"))) %>%
+      group_by(mate, word) %>%
+      summarise(n = sum(n)) %>%
+       tidyr::pivot_wider(names_from = word,
+                         names_prefix = "word_",
+                         values_from = n)
+  
+  advance <- advance %>%
+      inner_join(word_usage_tab, by = "mate")
+  
+  # do emoji analysis
+    
+    emoji_data <- rwhatsapp::emojis %>% # data built into package
+      mutate(hex_runes1 = gsub("\\s[[:alnum:]]+", "", hex_runes)) %>% # ignore combined emojis
+      mutate(emoji_url = paste0("https://abs.twimg.com/emoji/v2/72x72/", 
+                                tolower(hex_runes1), ".png"))
+    
+    # get emoji used at least 20 times
+    common_emoji <- super %>%
+      tidyr::unnest(emoji) %>%
+      count(emoji, sort = TRUE) %>%
+      filter(n >= 20) %>%
+       left_join(emoji_data, by = "emoji") %>%
+      pull(name) %>%
+      as.character()
+    
+    advance <- super %>%
+      tidyr::unnest(emoji) %>%
+      count(mate, emoji, sort = TRUE) %>%
+      
+      #group_by(mate) %>%
+      #top_n(n = 6, n) %>%
+      left_join(emoji_data, by = "emoji") %>%
+      filter(name %in% common_emoji) %>%
+      mutate(emoji_name = gsub(":", "", name),
+             emoji_name = gsub("-", "", emoji_name),
+             emoji_name = gsub(" ", "_", emoji_name)) %>%
+      dplyr::select(mate,n,emoji_name) %>%
+      distinct(across(c(mate, emoji_name)), .keep_all = T) %>%
+
+      tidyr::pivot_wider(names_from = emoji_name,
+                         names_glue = "emoji_name_{emoji_name}",
+                  values_from = n) %>%
+      replace(is.na(.), 0) %>%
+      inner_join(advance, by = "mate") %>%
+      mutate(across(starts_with("emoji_name"), ~ .x / slot, .names = "{.col}_emoji_freq"))
+      
+  return(advance)
+  
+  
+}    
+
+
+# load in pre-processed data
+if(file.exists(file.path("~/Documents/Personal/christianbromley.github.io/cbromley_artwork/", "dataset/example_chat_stats.txt"))){
+  
+  sentiment_stats <- read.table(file.path("~/Documents/Personal/christianbromley.github.io/cbromley_artwork/", "dataset/example_chat_sentiment_analysis.txt"), sep="\t", header=T)
+  
+  chat_stats <- read.table(file.path("~/Documents/Personal/christianbromley.github.io/cbromley_artwork/", "dataset/example_chat_stats.txt"), sep="\t", header=T)
+  
+  super <- cbind(chat, sentiment_stats)
+  
+}else{
+  advance <- compute_sentiment_stats(chat=chat, word_freq_cut = 20)
+
+all_stats <- wstats %>%
+  inner_join(advance, by = "mate")
+  
+}
+
+#write.table(all_stats,file = file.path("~/Documents/Personal/christianbromley.github.io/cbromley_artwork/", "dataset/example_chat_stats.txt"), sep="\t")
+
+
+
+
+```
+
+# Analysing Group WhatsApp Activity
+
+Let's look at the general characteristics and activity of Group 2.
+
+```{r, error=FALSE, message=FALSE, warning=FALSE, fig.width = 6,fig.height=3}
+
+    
+# plot the messages per day
+chat %>%
+  mutate(date = as.Date(time),
+           year = year(time),
+           month = month(time),
+           yearmon = as.yearmon(time)) %>%
+  filter(group == 2) %>%
+  group_by(date) %>%
+  summarise(n = n()) %>%
+  ggplot(aes(x = date, y = n)) +
+  geom_smooth(se=F, colour = "red")+
+  geom_bar(stat = "identity", fill = "yellow") +
+  theme_minimal()+
+  theme(
+        panel.background = element_rect(fill = "#333333", colour = "#333333",
+                                        size = 2, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.1, linetype = 'solid',
+                                        colour = "white"),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "#333333", colour = "white"),
+        plot.title = element_text(colour="white"),
+        axis.text.x = element_text(colour = "white", angle=45, hjust=1),
+        axis.text.y = element_text(colour = "white"),
+        axis.ticks = element_line(colour = "white"),
+        axis.title.x = element_text(colour="white"),
+        axis.title.y=element_text(colour="white"),
+        axis.line = element_line(colour="white"),
+        legend.background = element_rect(fill = "#333333", color = NA),
+        legend.key = element_rect(color = "#333333", fill = NA),
+        legend.title = element_blank(),
+        legend.text = element_text(color = "white"),
+        legend.position = c(0.8, 0.9)
+      )+
+  labs(x = "", y = "Messages per day", title = "")
+
+
+```
+
+
+
+
+What is the cumulative number of messages over time in the group?
+```{r, fig.width = 6,fig.height=3, error=FALSE, message=FALSE, warning=FALSE}
+
+chat %>%
+  mutate(date = as.Date(time),
+           year = year(time),
+           month = month(time),
+           yearmon = as.yearmon(time)) %>%
+  filter(group == 2) %>%
+  group_by(date) %>%
+  summarise(n = n()) %>%
+  mutate(cumsum = cumsum(n)) %>%
+  ggplot(aes(x = date, y = cumsum)) +
+  geom_line(colour = "yellow") +
+  theme_minimal()+
+  theme(
+        panel.background = element_rect(fill = "#333333", colour = "#333333",
+                                        size = 2, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.1, linetype = 'solid',
+                                        colour = "white"),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "#333333", colour = "white"),
+        plot.title = element_text(colour="white"),
+        axis.text.x = element_text(colour = "white", angle=45, hjust=1),
+        axis.text.y = element_text(colour = "white"),
+        axis.ticks = element_line(colour = "white"),
+        axis.title.x = element_text(colour="white"),
+        axis.title.y=element_text(colour="white"),
+        axis.line = element_line(colour="white"),
+        legend.background = element_rect(fill = "#333333", color = NA),
+        legend.key = element_rect(color = "#333333", fill = NA),
+        legend.title = element_blank(),
+        legend.text = element_text(color = "white"),
+        legend.position = "bottom"
+      )+
+  labs(x = "", y = "Cumulative messages", title = "")
+
+
+```
+
+Now what if we differentiate between author
+```{r, fig.width = 6,fig.height=9, error=FALSE, message=FALSE, warning=FALSE}
+cols <- c(brewer.pal(8, "Dark2"), brewer.pal(8, "Set1"), brewer.pal(8, "Paired"))
+chat %>%
+  mutate(date = as.Date(time),
+           year = year(time),
+           month = month(time),
+           yearmon = as.yearmon(time)) %>%
+  filter(group == 2) %>%
+  group_by(date, mate) %>%
+  summarise(n = n()) %>%
+  group_by(mate) %>%
+  mutate(cumsum = cumsum(n)) %>%
+  ggplot(aes(x = date, y = cumsum)) +
+  geom_line(aes(group = mate, colour = mate)) +
+  theme_bw()+
+  scale_colour_manual(values = cols)+
+  theme_minimal()+
+  theme(
+        panel.background = element_rect(fill = "#333333", colour = "#333333",
+                                        size = 2, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.1, linetype = 'solid',
+                                        colour = "white"),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "#333333", colour = "white"),
+        plot.title = element_text(colour="white"),
+        plot.subtitle = element_text(colour="white"),
+        axis.text.x = element_text(colour = "white", angle=45, hjust=1),
+        axis.text.y = element_text(colour = "white"),
+        axis.ticks = element_line(colour = "white"),
+        axis.title.x = element_text(colour="white"),
+        axis.title.y=element_text(colour="white"),
+        axis.line = element_line(colour="white"),
+        legend.background = element_rect(fill = "#333333", color = NA),
+        legend.key = element_rect(color = "#333333", fill = NA),
+        legend.title = element_blank(),
+        legend.text = element_text(color = "white"),
+        legend.position = "bottom"
+      )+
+  labs(x = "", y = "Cumulative messages", title = "Messages over time", subtitle = "Cumulative number of messages over time subdivided by author")
+```
+
+As you can see Ballack joined the group late but is a prolific chatter. You can see that Nelson Cuevas activity has dropped off into 2020. The rate of increase in Pauleta around the turn of 2016 is quite something!
+
+Let's just plot total messages.
+
+```{r, error=FALSE, message=FALSE, warning=FALSE}
+chat %>%
+  mutate(date = as.Date(time),
+           year = year(time),
+           month = month(time),
+           yearmon = as.yearmon(time)) %>%
+  filter(group == 2) %>%
+  group_by(mate) %>%
+  summarise(n = n()) %>%
+  ggplot(aes(y = n, reorder(x = mate, n, sum))) +
+  geom_bar(aes(fill = mate), stat="Identity") +
+  scale_fill_manual(values = cols)+
+  theme_minimal()+
+  theme(
+        panel.background = element_rect(fill = "#333333", colour = "#333333",
+                                        size = 2, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.1, linetype = 'solid',
+                                        colour = "white"),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "#333333", colour = "white"),
+        plot.title = element_text(colour="white"),
+        plot.subtitle = element_text(colour="white"),
+        axis.text.x = element_text(colour = "white", angle=45, hjust=1),
+        axis.text.y = element_text(colour = "white"),
+        axis.ticks = element_line(colour = "white"),
+        axis.title.x = element_text(colour="white"),
+        axis.title.y=element_text(colour="white"),
+        axis.line = element_line(colour="white"),
+        legend.background = element_rect(fill = "#333333", color = NA),
+        legend.key = element_rect(color = "#333333", fill = NA),
+        legend.title = element_blank(),
+        legend.text = element_text(color = "white"),
+        legend.position = "none"
+      )+
+  labs(x = "", y = "Number of messages", title = "")+
+  coord_flip()
+```
+
+As you can see there is lot of variation here with total messages ranging between <1000 and >40000. 
+
+Now let's take a look at sequences of messages. How do people tend to speak?
+
+Who speaks in clusters of messages?
+```{r, error=FALSE, message=FALSE, warning=FALSE}
+# now analyse message clusters
+sequences <- rle(as.character(chat$mate[chat$group == 2]))
+mate_seq <- data.frame(mate = sequences$values,
+           sequence = sequences$lengths)
+
+mate_seq %>%
+  tibble %>%
+  group_by(mate, sequence) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n/sum(n)) %>%
+  ggplot(aes(mate, freq))+
+  geom_bar(stat = "identity", aes(fill = factor(sequence)))+
+  scale_fill_brewer(palette = "RdBu")+
+  theme_bw()+
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle=45, hjust=1))+
+  labs(x="")
+```
+
+From this we can see that Paulete chats in a far lower proportion of 1 line messages, whereas borgetti, raul and vieri are the opposite and are much more succinct.
+
+# Analysing Individual WhatsApp Activity
+
+Now that we have done of the data processing we can begin to ask some mor interesting questions of the data.
+
+Firstly, let's look at the frequency of messages and message sequences in Group 2. Look for sequences of greater than 3 messages.
+
+```{r, message=F, error=F, warning=F, fig.height=4, fig.width=6}
+
+ggplot(chat_stats, aes(group2_messages_per_day, group2_seq3_per_day))+
+  geom_point(fill = "yellow", shape=21, size=3)+
+  geom_smooth(se=F, colour = "white")+
+  theme_minimal()+
+  theme(
+        panel.background = element_rect(fill = "#333333", colour = "#333333",
+                                        size = 2, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.1, linetype = 'solid',
+                                        colour = "white"),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "#333333", colour = "white"),
+        plot.title = element_text(colour="white"),
+        axis.text.x = element_text(colour = "white", angle=45, hjust=1),
+        axis.text.y = element_text(colour = "white"),
+        axis.ticks = element_line(colour = "white"),
+        axis.title.x = element_text(colour="white"),
+        axis.title.y=element_text(colour="white"),
+        axis.line = element_line(colour="white"),
+        legend.background = element_rect(fill = "#333333", color = NA),
+        legend.key = element_rect(color = "#333333", fill = NA),
+        legend.title = element_blank(),
+        legend.text = element_text(color = "white"),
+        legend.position = c(0.8, 0.9)
+      )+
+  labs(x = "Messages per day (group 2)", y = "Message Sequences (>=3) per day (group 2")+
+  geom_text_repel(label = as.character(chat_stats$mate), colour = "white")
+
+```
+
+As you can see, there's a powerful correlation between messages per day and sequences of messages greater than or equal to 3 messages. Does this remain to be the case if you look at sequences greater than 6?
+
+```{r, message=F, error=F, warning=F}
+
+ggplot(chat_stats, aes(group2_messages_per_day, group2_seq6_per_day))+
+  geom_point(fill = "yellow", shape=21, size=3)+
+  geom_smooth(se=F, colour = "white")+
+  theme_minimal()+
+  theme(
+        panel.background = element_rect(fill = "#333333", colour = "#333333",
+                                        size = 2, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.1, linetype = 'solid',
+                                        colour = "white"),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "#333333", colour = "white"),
+        plot.title = element_text(colour="white"),
+        axis.text.x = element_text(colour = "white", angle=45, hjust=1),
+        axis.text.y = element_text(colour = "white"),
+        axis.ticks = element_line(colour = "white"),
+        axis.title.x = element_text(colour="white"),
+        axis.title.y=element_text(colour="white"),
+        axis.line = element_line(colour="white"),
+        legend.background = element_rect(fill = "#333333", color = NA),
+        legend.key = element_rect(color = "#333333", fill = NA),
+        legend.title = element_blank(),
+        legend.text = element_text(color = "white"),
+        legend.position = c(0.8, 0.9)
+      )+
+  labs(x = "Messages per day (group 2)", y = "Message Sequences (>=6) per day (group 2", title = "Message frequency versus long message sequences")+
+  geom_text_repel(label = as.character(chat_stats$mate), colour = "white")
+
+```
+
+The relationship becomes far shakier although Pauleta's frequency for large sequences might be skewing the data.
+
+Next let's look at involvement in conversations that we defined as daily chats over 100 messages in total.
+
+```{r, message=F, error=F, warning=F}
+
+ggplot(chat_stats, aes(group2_messages_per_day, group2_message_per_convo))+
+  geom_point(fill = "yellow", shape=21, size=3)+
+  geom_smooth(se=F, colour = "white", method = "lm")+
+  theme_minimal()+
+  theme(
+        panel.background = element_rect(fill = "#333333", colour = "#333333",
+                                        size = 2, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.1, linetype = 'solid',
+                                        colour = "white"),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "#333333", colour = "white"),
+        plot.title = element_text(colour="white"),
+        axis.text.x = element_text(colour = "white", angle=45, hjust=1),
+        axis.text.y = element_text(colour = "white"),
+        axis.ticks = element_line(colour = "white"),
+        axis.title.x = element_text(colour="white"),
+        axis.title.y=element_text(colour="white"),
+        axis.line = element_line(colour="white"),
+        legend.background = element_rect(fill = "#333333", color = NA),
+        legend.key = element_rect(color = "#333333", fill = NA),
+        legend.title = element_blank(),
+        legend.text = element_text(color = "white"),
+        legend.position = c(0.8, 0.9)
+      )+
+  labs(x = "Messages per day (group 2)", y = "Messages per conversation (group 2", title = "Isolated messages versus messages in big conversations")+
+  geom_text_repel(label = as.character(chat_stats$mate), colour = "white")
+
+```
+
+There's really quite a nice linear relationship between total messages and messagers per conversation.
+
+What about sequences per conversation? Are there people that don't send messages too frequently but enjoy getting involved in the debates?
+
+```{r, message=F, error=F, warning=F}
+
+ggplot(chat_stats, aes(group2_messages_per_day, group2_seq5_per_convo))+
+  geom_point(fill = "yellow", shape=21, size=3)+
+  geom_smooth(se=F, colour = "white")+
+  theme_minimal()+
+  theme(
+        panel.background = element_rect(fill = "#333333", colour = "#333333",
+                                        size = 2, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.1, linetype = 'solid',
+                                        colour = "white"),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "#333333", colour = "white"),
+        plot.title = element_text(colour="white"),
+        axis.text.x = element_text(colour = "white", angle=45, hjust=1),
+        axis.text.y = element_text(colour = "white"),
+        axis.ticks = element_line(colour = "white"),
+        axis.title.x = element_text(colour="white"),
+        axis.title.y=element_text(colour="white"),
+        axis.line = element_line(colour="white"),
+        legend.background = element_rect(fill = "#333333", color = NA),
+        legend.key = element_rect(color = "#333333", fill = NA),
+        legend.title = element_blank(),
+        legend.text = element_text(color = "white"),
+        legend.position = c(0.8, 0.9)
+      )+
+  labs(x = "Messages per day (group 2)", y = "Messages sequences (>=5) per conversation (group 2", 
+       title = "Message frequency against conversation involvement")+
+  geom_text_repel(label = as.character(chat_stats$mate), colour = "white")
+
+```
+
+Again the data is being skewed heavily by Pauleta but Nelson Cuevas for example writes a similar frequency of overall messages as Klose but a clearly higher frequency of sequences.
+
+# Language analysis
+
+
+Now let's analyse the language being used by each person. First let's look at the most frequntly used words.
+```{r, echo=FALSE,error=FALSE, message=FALSE, warning=FALSE}
+
+
+# remove_stops <- c(stopwords(),
+#                "media",
+#                "omitted",
+#                "ref",
+#                "sam", "smith", "dennis", "brom", "sean", "keith", "keithy", "image", "https", "ball", "nut", "nutty", "dom",
+#                "mike", "nay", "phil", "shell", "ak", "andy", "jessie", "spidey", "dors", "philippa", "amy", "kaza", "mollie", "mike's", "adim's")
+
+remove_stops <- c(stopwords(),
+               "media",
+               "omitted",
+               "ref")
+
+
+chat %>%
+  mutate(date = as.Date(time),
+           year = year(time),
+           month = month(time),
+           yearmon = as.yearmon(time)) %>%
+  filter(group == 2) %>%
+  unnest_tokens(input = text,
+                output = word) %>%
+  filter(!word %in% remove_stops) %>%
+  count(mate, word, sort = TRUE) %>%
+  #group_by(mate) %>%
+  top_n(n = 20, n) %>%
+  ggplot(aes(x = reorder_within(word, n, mate), y = n, fill = mate)) +
+  geom_col(show.legend = FALSE, fill = "yellow") +
+  theme_minimal()+
+  theme(
+        panel.background = element_rect(fill = "#333333", colour = "#333333",
+                                        size = 2, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.1, linetype = 'solid',
+                                        colour = "white"),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "#333333", colour = "white"),
+        plot.title = element_text(colour="white"),
+        axis.text.x = element_text(colour = "white", angle=45, hjust=1),
+        axis.text.y = element_text(colour = "white"),
+        axis.ticks = element_line(colour = "white"),
+        axis.title.x = element_text(colour="white"),
+        axis.title.y=element_text(colour="white"),
+        axis.line = element_line(colour="white"),
+        legend.background = element_rect(fill = "#333333", color = NA),
+        legend.key = element_rect(color = "#333333", fill = NA),
+        legend.title = element_blank(),
+        legend.text = element_text(color = "white"),
+        legend.position = c(0.8, 0.9)
+      )+
+  ylab("") +
+  xlab("") +
+  coord_flip() +
+  scale_x_reordered() +
+  ggtitle("Most often used words")
+
+
+```
+
+You can see that this isn't particularly informative. There's a lot of laughing and a lot of agreement. 
+
+Can we identify words that are uniquely utilised by individuals? I will remove __names__ as I don't want to compromise anyone's anonymity. Let's just say people talk about other people a lot!
+
+```{r, error=FALSE, message=FALSE, warning=FALSE, fig.height=12, fig.width=5}
+
+
+# let's search for terms that are uniquely frequent to each person
+
+tf_idf_dta <- chat %>%
+  mutate(date = as.Date(time),
+           year = year(time),
+           month = month(time),
+           yearmon = as.yearmon(time)) %>%
+  filter(group == 2) %>%
+  unnest_tokens(input = text,
+                output = word) %>%
+  select(word, mate) %>%
+  filter(!word %in% remove_stops) %>%
+  mutate(word = gsub(".com", "", word)) %>%
+  count(mate, word, sort = TRUE) %>%
+  bind_tf_idf(term = word, document = mate, n = n) %>%
+  filter(n > 10) %>%
+  group_by(mate) %>%
+  top_n(n = 10, tf_idf)
+
+tf_idf_dta %>%
+  filter(tf_idf > 0) %>%
+  ggplot(aes(x = reorder_within(word, n, mate), y = n, fill = mate)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_manual(values = cols)+
+  theme_minimal()+
+  theme(
+        panel.background = element_rect(fill = "#333333", colour = "#333333",
+                                        size = 2, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.1, linetype = 'solid',
+                                        colour = "white"),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "#333333", colour = "white"),
+        plot.title = element_text(colour="white"),
+        axis.text.x = element_text(colour = "white", angle=45, hjust=1),
+        axis.text.y = element_text(colour = "white"),
+        axis.ticks = element_line(colour = "white"),
+        axis.title.x = element_text(colour="white"),
+        axis.title.y=element_text(colour="white"),
+        axis.line = element_line(colour="white"),
+        strip.text = element_text(colour = "white"),
+        legend.background = element_rect(fill = "#333333", color = NA),
+        legend.key = element_rect(color = "#333333", fill = NA),
+        legend.title = element_blank(),
+        legend.text = element_text(color = "white"),
+        legend.position = c(0.8, 0.9)
+      )+
+  ylab("") +
+  xlab("") +
+  coord_flip() +
+  facet_wrap(~mate, ncol = 2, scales = "free_y") +
+  scale_x_reordered() +
+  scale_y_continuous(trans='log10') +
+  ggtitle("Important words unique to different authors")
+
+
+
+```
+
+There are some really interesting findings here. 
+
+* first Henrik Larsson seems like he has a great time on this group. He's the one laughing the most.
+* we can see that Ronaldo is a particular fan of talking about Badminton whereas Nelson  loves talking about clinical stuff.
+* Henri Camera and Marc Wilmots have an affinity for Blackburn and Tranmere respectively.
+
+## Positivity analysis
+
+Which people are more positive than others? It's a bit question and one that we can quantitate using different methods.
+
+Let's take a look at a couple of these methods. We will normalise positivity scores from individual messages by the total number of messages by each person.
+
+```{r, error=FALSE, message=FALSE, warning=FALSE}
+ggplot(chat_stats, aes(reorder(mate, freq_syuzhet, sum), freq_syuzhet))+
+  geom_bar(fill = "yellow", stat= "identity")+
+  
+  theme_minimal()+
+  theme(
+        panel.background = element_rect(fill = "#333333", colour = "#333333",
+                                        size = 2, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.1, linetype = 'solid',
+                                        colour = "white"),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "#333333", colour = "white"),
+        plot.title = element_text(colour="white"),
+        plot.subtitle = element_text(colour="white"),
+        axis.text.x = element_text(colour = "white", angle=45, hjust=1),
+        axis.text.y = element_text(colour = "white"),
+        axis.ticks = element_line(colour = "white"),
+        axis.title.x = element_text(colour="white"),
+        axis.title.y=element_text(colour="white"),
+        axis.line = element_line(colour="white"),
+        legend.background = element_rect(fill = "#333333", color = NA),
+        legend.key = element_rect(color = "#333333", fill = NA),
+        legend.title = element_blank(),
+        legend.text = element_text(color = "white"),
+        legend.position = c(0.8, 0.9)
+      )+
+  labs(x = "", y = "", title = "Average Positivity per Message", subtitle = "Syuzhet method")+
+    coord_flip()
+
+
+
+```
+
+From this method of scoring, Jard Borgetti looks really positive relative to others, although we know there is a much smaller sampl size for Jared which might influence this result. If Jared chatted more frequently his positivity may regress but remain high. 
+
+A value less than 0 would indicate negative outweighting positive messages so at least everyone is more positive in the way they chat.
+
+Let's plot these graphs for a few other methods.
+
+```{r, error=FALSE, message=FALSE, warning=FALSE}
+ggplot(chat_stats, aes(reorder(mate, freq_bing, sum), freq_bing))+
+  geom_bar(fill = "red", stat= "identity")+
+  
+  theme_minimal()+
+  theme(
+        panel.background = element_rect(fill = "#333333", colour = "#333333",
+                                        size = 2, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.1, linetype = 'solid',
+                                        colour = "white"),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "#333333", colour = "white"),
+        plot.title = element_text(colour="white"),
+        plot.subtitle = element_text(colour="white"),
+        axis.text.x = element_text(colour = "white", angle=45, hjust=1),
+        axis.text.y = element_text(colour = "white"),
+        axis.ticks = element_line(colour = "white"),
+        axis.title.x = element_text(colour="white"),
+        axis.title.y=element_text(colour="white"),
+        axis.line = element_line(colour="white"),
+        legend.background = element_rect(fill = "#333333", color = NA),
+        legend.key = element_rect(color = "#333333", fill = NA),
+        legend.title = element_blank(),
+        legend.text = element_text(color = "white"),
+        legend.position = c(0.8, 0.9)
+      )+
+  labs(x = "", y = "", title = "Average Positivity per Message", subtitle = "Bing method")+
+    coord_flip()
+
+
+ggplot(chat_stats, aes(reorder(mate, freq_nrc, sum), freq_nrc))+
+  geom_bar(fill = "green", stat= "identity")+
+  
+  theme_minimal()+
+  theme(
+        panel.background = element_rect(fill = "#333333", colour = "#333333",
+                                        size = 2, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.1, linetype = 'solid',
+                                        colour = "white"),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "#333333", colour = "white"),
+        plot.title = element_text(colour="white"),
+        plot.subtitle = element_text(colour="white"),
+        axis.text.x = element_text(colour = "white", angle=45, hjust=1),
+        axis.text.y = element_text(colour = "white"),
+        axis.ticks = element_line(colour = "white"),
+        axis.title.x = element_text(colour="white"),
+        axis.title.y=element_text(colour="white"),
+        axis.line = element_line(colour="white"),
+        legend.background = element_rect(fill = "#333333", color = NA),
+        legend.key = element_rect(color = "#333333", fill = NA),
+        legend.title = element_blank(),
+        legend.text = element_text(color = "white"),
+        legend.position = c(0.8, 0.9)
+      )+
+  labs(x = "", y = "", title = "Average Positivity per Message", subtitle = "NRC method")+
+    coord_flip()
+```
+
+We can see trends from this analysis despite evident variance between methods. For example Raul second last by NRC but second top by Bing, and somewhere in the middle by Syuhet. Others have greater consistency. Papa Bouba Diop for example is consitently high as is Christian Vieri. Jon-Dahl is consistently low, although again he is not a frequent chatter.
+
+Syuzhet also gives us individual values of positivity and negativity. Let's look at the relationship of these across our authors.
+
+```{r, error=FALSE, message=FALSE, warning=FALSE, fig.height =5, fig.width=5}
+
+ggplot(chat_stats, aes(freq_positive, freq_negative))+
+  geom_point(fill = "yellow", shape=21, size=3)+
+  geom_smooth(se=F, colour = "white", method = "lm")+
+  theme_minimal()+
+  theme(
+        panel.background = element_rect(fill = "#333333", colour = "#333333",
+                                        size = 2, linetype = "solid"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "#333333", colour = "white"),
+        plot.title = element_text(colour="white"),
+        axis.text.x = element_text(colour = "white", angle=45, hjust=1),
+        axis.text.y = element_text(colour = "white"),
+        axis.ticks = element_line(colour = "white"),
+        axis.title.x = element_text(colour="white"),
+        axis.title.y=element_text(colour="white"),
+        axis.line = element_line(colour="white"),
+        legend.background = element_rect(fill = "#333333", color = NA),
+        legend.key = element_rect(color = "#333333", fill = NA),
+        legend.title = element_blank(),
+        legend.text = element_text(color = "white"),
+        legend.position = c(0.8, 0.9)
+      )+
+  labs(x = "Positive score", y = "Negative score", title = "Comparison of positivity and negativity within messages")+
+  geom_hline(yintercept = median(chat_stats$freq_negative), colour = "red")+
+  geom_vline(xintercept = median(chat_stats$freq_positive), colour = "red")+
+  geom_text_repel(label = as.character(chat_stats$mate), colour = "white")
+
+
+
+```
+
+There is a positive correlation which may be based in the way that people speak. People that have higher scores may just be more emotive in the way they speak on the group. So what we are looking for is deviation from the linear trend. From this we know that Pauleta seems highly skewed towards negative scores. Henri Camera may also be skewed slightly negative. Again Jared Borgetti is super positive. Papa Bouba Diop and Robbie Keane are also examples of more positive people.
+
+Now let's take a look at trends in positivity over time with the syuzhet method.
+
+```{r, error=FALSE, message=FALSE, warning=FALSE, fig.height =10, fig.width=5}
+
+super %>%
+  mutate(date = as.Date(time),
+           year = year(time),
+           month = month(time),
+           yearmon = as.yearmon(time)) %>%
+  filter(group == 2) %>%
+  dplyr::mutate(
+                slot = rep(1, nrow(.))) %>%
+  group_by(yearmon, mate) %>%
+  summarise_at(vars(anger:positive, slot), sum) %>%
+  tidyr::pivot_longer(cols = c(anger:positive),
+               names_to = "sentiment",
+               values_to = "cum.score") %>%
+  group_by(yearmon, mate) %>%
+  mutate(freq = cum.score / slot) %>%
+  filter(sentiment == "positive") %>%
+  ggplot(aes(x = yearmon, y = freq)) +
+  geom_line(aes(group = mate, colour = mate)) +
+  theme_minimal()+
+  theme(
+        panel.background = element_rect(fill = "#333333", colour = "#333333",
+                                        size = 2, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.1, linetype = 'solid',
+                                        colour = "white"),
+        panel.grid.minor = element_blank(),
+        strip.text = element_text(colour="white"),
+        plot.background = element_rect(fill = "#333333", colour = "white"),
+        plot.title = element_text(colour="white"),
+        axis.text.x = element_text(colour = "white", angle=45, hjust=1),
+        axis.text.y = element_text(colour = "white"),
+        axis.ticks = element_line(colour = "white"),
+        axis.title.x = element_text(colour="white"),
+        axis.title.y=element_text(colour="white"),
+        axis.line = element_line(colour="white"),
+        legend.background = element_rect(fill = "#333333", color = NA),
+        legend.key = element_rect(color = "#333333", fill = NA),
+        legend.title = element_blank(),
+        legend.text = element_text(color = "white"),
+        legend.position = c(0.8, 0.9)
+      )+
+  scale_colour_manual(values = cols)+
+  theme(plot.title = element_text(hjust=0.5),
+        legend.title = element_blank(),
+        legend.position = "none")+
+  labs(x = "", y = "Positivity Over Time", title = "")+
+  facet_wrap(~mate, ncol = 2)
+
+```
+
+It has to be said that mostly people have remained quite consistently positive. Pauleta who we know talks a lot seems to be talking more positively since Jan 2020. We will see if that trend continues long term. The same might be said of Henri Camera.
+
+Now let's take a look at negativity.
+
+```{r, error=FALSE, message=FALSE, warning=FALSE, fig.height =10, fig.width=5}
+
+super %>%
+  mutate(date = as.Date(time),
+           year = year(time),
+           month = month(time),
+           yearmon = as.yearmon(time)) %>%
+  filter(group == 2) %>%
+  dplyr::mutate(
+                slot = rep(1, nrow(.))) %>%
+  group_by(yearmon, mate) %>%
+  summarise_at(vars(anger:positive, slot), sum) %>%
+  tidyr::pivot_longer(cols = c(anger:positive),
+               names_to = "sentiment",
+               values_to = "cum.score") %>%
+  group_by(yearmon, mate) %>%
+  mutate(freq = cum.score / slot) %>%
+  filter(sentiment == "negative") %>%
+  ggplot(aes(x = yearmon, y = freq)) +
+  geom_line(aes(group = mate, colour = mate)) +
+  theme_minimal()+
+  theme(
+        panel.background = element_rect(fill = "#333333", colour = "#333333",
+                                        size = 2, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.1, linetype = 'solid',
+                                        colour = "white"),
+        panel.grid.minor = element_blank(),
+        strip.text = element_text(colour="white"),
+        plot.background = element_rect(fill = "#333333", colour = "white"),
+        plot.title = element_text(colour="white"),
+        axis.text.x = element_text(colour = "white", angle=45, hjust=1),
+        axis.text.y = element_text(colour = "white"),
+        axis.ticks = element_line(colour = "white"),
+        axis.title.x = element_text(colour="white"),
+        axis.title.y=element_text(colour="white"),
+        axis.line = element_line(colour="white"),
+        legend.background = element_rect(fill = "#333333", color = NA),
+        legend.key = element_rect(color = "#333333", fill = NA),
+        legend.title = element_blank(),
+        legend.text = element_text(color = "white"),
+        legend.position = c(0.8, 0.9)
+      )+
+  scale_colour_manual(values = cols)+
+  theme(plot.title = element_text(hjust=0.5),
+        legend.title = element_blank(),
+        legend.position = "none")+
+  labs(x = "", y = "Negativity Over Time", title = "")+
+  facet_wrap(~mate, ncol = 2)
+
+```
+
+The interesting trends in negativity come from Vieri and Pauleta. Strikingly Pauleta is demonstrating increasing levels of negativity, although his positivity trend was also on an upwards trajectory. This may point towards improved levels of grammar confound the analysis. Increased usage of emotive words over time giving an impression of higher positivity and negativity.
+
+Plot together positivity and negativity.
+```{r, error=FALSE, message=FALSE, warning=FALSE, fig.height =10, fig.width=5}
+
+super %>%
+  mutate(date = as.Date(time),
+           year = year(time),
+           month = month(time),
+           yearmon = as.yearmon(time)) %>%
+  filter(group == 2) %>%
+  dplyr::mutate(
+                slot = rep(1, nrow(.))) %>%
+  group_by(yearmon, mate) %>%
+  summarise_at(vars(anger:positive, slot), sum) %>%
+  tidyr::pivot_longer(cols = c(anger:positive),
+               names_to = "sentiment",
+               values_to = "cum.score") %>%
+  group_by(yearmon, mate) %>%
+  mutate(freq = cum.score / slot) %>%
+  filter(sentiment %in% c("negative", "positive")) %>%
+  ggplot(aes(x = yearmon, y = freq)) +
+  geom_line(aes(group = sentiment, colour = sentiment)) +
+  theme_minimal()+
+  theme(
+        panel.background = element_rect(fill = "#333333", colour = "#333333",
+                                        size = 2, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.1, linetype = 'solid',
+                                        colour = "white"),
+        panel.grid.minor = element_blank(),
+        strip.text = element_text(colour="white"),
+        plot.background = element_rect(fill = "#333333", colour = "white"),
+        plot.title = element_text(colour="white"),
+        axis.text.x = element_text(colour = "white", angle=45, hjust=1),
+        axis.text.y = element_text(colour = "white"),
+        axis.ticks = element_line(colour = "white"),
+        axis.title.x = element_text(colour="white"),
+        axis.title.y=element_text(colour="white"),
+        axis.line = element_line(colour="white"),
+        legend.background = element_rect(fill = "#333333", color = NA),
+        legend.key = element_rect(color = "#333333", fill = NA),
+        legend.title = element_blank(),
+        legend.text = element_text(color = "white"),
+        legend.position = "top"
+      )+
+  scale_colour_manual(values = cols)+
+  labs(x = "", y = "Emotion score", title = "Positivity v Negativity Over Time")+
+  facet_wrap(~mate, ncol = 2)
+
+```
+
+We can see in a number of cases a divergence between positivity and negativity since late 2019 perhaps most notably for Papa Bouba Diop but also for Ilhan, Vieri and Ronaldo, and even Pauleta.
+
+
+__Other emotions__ 
+
+We have a number of other emotions that we can measure. Let's try to plot these.
+
+```{r, error=FALSE, message=FALSE, warning=FALSE}
+chat_stats <- chat_stats %>%
+  mutate(whatsapp = rep("whatsapp", nrow(.)))
+
+ggplot(chat_stats, aes(x = freq_anger, y = whatsapp)) +
+  geom_density_ridges(
+    aes( point_fill = whatsapp, point_shape = whatsapp),
+    alpha = .2, point_alpha = 1, jittered_points = TRUE, point_size = 5, colour = "white",scale = 0.5, point_color = "yellow"
+  ) +
+ # scale_point_color_hue(l = 2) +
+  theme_minimal()+
+  theme(
+        panel.background = element_rect(fill = "#333333", colour = "#333333",
+                                        size = 2, linetype = "solid"),
+        panel.grid.major = element_line(size = 0.1, linetype = 'solid',
+                                        colour = "white"),
+        panel.grid.minor = element_blank(),
+        strip.text = element_text(colour="white"),
+        plot.background = element_rect(fill = "#333333", colour = "white"),
+        plot.title = element_text(colour="white"),
+        axis.text.x = element_text(colour = "white", angle=45, hjust=1),
+        axis.text.y = element_blank(),
+        axis.ticks = element_line(colour = "white"),
+        axis.title.x = element_text(colour="white"),
+        axis.title.y=element_blank(),
+        axis.line.x = element_line(colour="white"),
+        axis.line.y = element_blank(),
+        legend.background = element_rect(fill = "#333333", color = NA),
+        legend.key = element_rect(color = "#333333", fill = NA),
+        legend.title = element_blank(),
+        legend.text = element_text(color = "white"),
+        legend.position = "none"
+      )+
+
+ 
+  labs (x = "Anger score / Number of messages", title = "Anger per message")
+  
+
+
+```
+
+One person is sticking out as having higher anger scores. Let's examine all the emotions together.
+
+```{r, error=FALSE, message=FALSE, warning=FALSE}
+
+for_hm <- chat_stats %>% select(freq_anger:freq_trust)
+rownames(for_hm) <- chat_stats$mate
+
+draw_colnames_45 <- function (coln, gaps, ...) {
+  coord <- pheatmap:::find_coordinates(length(coln), gaps)
+  x     <- coord$coord - 0.5 * coord$size
+  res   <- grid::textGrob(
+    coln, x = x, y = unit(1, "npc") - unit(3,"bigpts"),
+    vjust = 0.75, hjust = 1, rot = 90, gp = grid::gpar(...)
+  )
+  return(res)
+}
+assignInNamespace(
+  x = "draw_colnames",
+  value = "draw_colnames_45",
+  ns = asNamespace("pheatmap")
+)
+
+pheatmap(t(for_hm), 
+         cluster_cols = T,
+         cluster_rows = T,
+         scale = "row",
+         col = colorRampPalette(c("blue", "white", "red"))(21),
+         border_color = "white")
+
+```
+
+
+Firstly, We can see Pauleta and Borgetti stick out like a sore thumb. Pauleta skews the data towards more negative emotions whereas Borgetti is really the highest for the more positive emotions. We are aware of the caveat of the sample size for people like Borgetti. Elsewhere there's a cluster of people including Rivaldo, LArsson, Tomasson and Mansiz that have low levels of all emotions altogether. These are perhaps the people that talk less and with more reservation. 
+
+Mor interesting cases are those that Diop and Morientes. Diop is full of joy and anticipation ranking third highest for these metrics, yet very low on sadness and anger. Generally, sounding like a happy influence in the group. Morientes isn't particularly high for fear and anger but these are his more dominant emotions.
+
+Klose Vieri and Cuevas are all very similar on an emotional level demonstrating high levels of disgust, and not a lot of joy or anticipation.
+
+# Clustering WhatsApp Personalities
+
+Finally, let's cluster these personalities. Who has a similar WhatsApp profile to one another?
+
+Let's do PCA analysis using a subset of variables that we think could represent key personality traits. Plot the contribution of variables to each PC.
+
+```{r, error=FALSE, message=FALSE, warning=FALSE}
+
+# select variables of interest
+for_pca <- chat_stats %>% 
+  #select(group1_seq_per_convo:group2_seq10_per_day, freq_anger:freq_nrc, ends_with("emoji_freq"), -starts_with("group1"))
+  #select(group1_seq_per_convo:group2_seq10_per_day, freq_anger:freq_nrc, -starts_with("group1"))
+  select(group2_messages_per_day, group2_seq1_per_day, group2_seq5_per_day, group2_message_per_convo, group2_seq1_per_convo, group2_seq5_per_convo, freq_anger:freq_nrc,
+         emoji_name_face_with_tears_of_joy_emoji_freq, emoji_name_eyes_emoji_freq, emoji_name_fire_emoji_freq, emoji_name_seenoevil_monkey_emoji_freq, emoji_name_thinking_face_emoji_freq, emoji_name_woozy_face_emoji_freq, emoji_name_flushed_face_emoji_freq, emoji_name_face_with_rolling_eyes_emoji_freq, emoji_name_grinning_face_with_sweat_emoji_freq)
+  
+rownames(for_pca) <- chat_stats$mate
+
+
+# normalise
+for_pca <- scale(for_pca, scale=T, center = T)
+
+# do pca
+pca <- prcomp(for_pca)
+
+fviz_contrib(pca, choice = "var", axes = 1, top = 10)
+fviz_contrib(pca, choice = "var", axes = 2, top = 10)
+
+
+
+```
+
+What do we take from this? Well PC1, with the highest amount of variance seems to be dominated by emotive variables but neither skewed to positive or negative ones, so it seems this may represent "expressiveness" (if that's a word).
+
+The second PC correlates with positivity scores but also with message frequency.
+
+Now let's cast our "mates" onto these PCs. Who clusters together?
+
+```{r, error=FALSE, message=FALSE, warning=FALSE, fig.width=5, fig.height=5}
+
+fviz_pca_var(pca, col.var="contrib",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE # Avoid text overlapping
+             )+
+  theme(
+        panel.background = element_rect(fill = "#333333", colour = "#333333",
+                                        size = 2, linetype = "solid"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "#333333", colour = "white"),
+        plot.title = element_text(colour="white"),
+        axis.text.x = element_text(colour = "white", angle=45, hjust=1),
+        axis.text.y = element_text(colour = "white"),
+        axis.ticks = element_line(colour = "white"),
+        axis.title.x = element_text(colour="white"),
+        axis.title.y=element_text(colour="white"),
+        axis.line = element_line(colour="white"),
+        legend.background = element_rect(fill = "#333333", color = NA),
+        legend.key = element_rect(color = "#333333", fill = NA),
+        legend.title = element_blank(),
+        legend.text = element_text(color = "white"),
+        legend.position = "none"
+      )
+```
+
+
+This plot tells us the the direction that high values for particular variables predicts for. You can see for example that the level of Joy in a person's messages pushes them towards to the top right quadrant.
+
+```{r, error=FALSE, message=FALSE, warning=FALSE, fig.width=5, fig.height=5}
+fviz_pca_ind(pca, col.ind = "cos2",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE # Avoid text overlapping (slow if many points)
+             )+
+  theme(
+        panel.background = element_rect(fill = "#333333", colour = "#333333",
+                                        size = 2, linetype = "solid"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "#333333", colour = "white"),
+        plot.title = element_text(colour="white"),
+        axis.text.x = element_text(colour = "white", angle=45, hjust=1),
+        axis.text.y = element_text(colour = "white"),
+        axis.ticks = element_line(colour = "white"),
+        axis.title.x = element_text(colour="white"),
+        axis.title.y=element_text(colour="white"),
+        axis.line = element_line(colour="white"),
+        legend.background = element_rect(fill = "#333333", color = NA),
+        legend.key = element_rect(color = "#333333", fill = NA),
+        legend.title = element_blank(),
+        legend.text = element_text(color = "white"),
+        legend.position = "right"
+      )
+```
+
+
+Now let's do Kmeans clustering to group people into factions based on their Whatsapp profile.
+
+```{r, error=FALSE, message=FALSE, warning=FALSE, fig.width=5, fig.height=5}
+
+#fviz_nbclust(for_pca, kmeans, method = "wss")
+
+
+set.seed(123)
+kres <- kmeans(for_pca, 4, nstart=20)
+
+fviz_cluster(kres, for_pca) + 
+  scale_color_manual(values = cols)+
+  scale_fill_manual(values = cols)+
+  theme(
+        panel.background = element_rect(fill = "#333333", colour = "#333333",
+                                        size = 2, linetype = "solid"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "#333333", colour = "white"),
+        plot.title = element_text(colour="white"),
+        axis.text.x = element_text(colour = "white", angle=45, hjust=1),
+        axis.text.y = element_text(colour = "white"),
+        axis.ticks = element_line(colour = "white"),
+        axis.title.x = element_text(colour="white"),
+        axis.title.y=element_text(colour="white"),
+        axis.line = element_line(colour="white"),
+        legend.background = element_rect(fill = "#333333", color = NA),
+        legend.key = element_rect(color = "#333333", fill = NA),
+        legend.title = element_blank(),
+        legend.text = element_text(color = "white"),
+        legend.position = "none"
+      )
+
+```
+
+
+And so we can see 4 unique clusters of mates within this group. The green cluster are a quieter group that use emojis such as the fire emoji and the laughing emoji,
+
+The second cluster in purple are more expressive, more engaged in the conversation but perhaps with more negativity.
+
+Then, there are two really unique people. Borgetti and Pauleta really show opposite profiles in terms of positivity and activity.
+
+
+# Conclusions
+
+Well it has certainly been a learning experience for me with regards to text analysis. It's difficult because these dictionary-based methods are reliant on correct use of the English language. Colloquialisms are therefore a big problem I imagine. 
+
+My plan now is to firstly build these functions into an R package, and then build a Shiny app allowing easy browsing of the data. I just need to find the time.
+
+```{r}
+
+sessionInfo()
+
+```
