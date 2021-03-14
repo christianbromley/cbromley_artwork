@@ -9,8 +9,6 @@ navbar:
       menu:
         - text: "Analytics Home"
           href: analytics.html
-        - text: "Mining WhatsApp Groups"
-          href: whatsapp.html
     - text: "Artwork"
       menu:
         - text: "Artwork Home"
